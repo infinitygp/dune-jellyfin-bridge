@@ -16,6 +16,13 @@ video intent to Dune, applies Jellyfin's initial position with Dune's local IP
 Control API, polls the same API while playback is active, and returns the last
 observed position when the user exits Dune.
 
+The Dune Android intent handler does not consume Jellyfin's external subtitle
+extras. When Jellyfin supplies subtitles, the bridge locates the same media file
+in Dune's active NFS mounts using its filename and, when available, its size. It
+then opens that file through Dune's native `nfs://`, `nfs-tcp://`, or
+`nfs-udp://` URL. This lets the native player discover adjacent subtitle files
+while preserving Jellyfin's title and resume position.
+
 ## Requirements
 
 - JDK 21 (declared in `.mise.toml`)
@@ -44,6 +51,14 @@ adb -s 192.168.1.181:5555 install -r app/build/outputs/apk/debug/app-debug.apk
 In Jellyfin, enable the external player. When Android asks which player should
 handle the video, select **Dune Player (Jellyfin Bridge)**. The bridge will open
 the original Dune player automatically.
+
+For external subtitles, the original media file must also be available through
+an NFS share already configured and mounted in Dune. Keep subtitle files next to
+the media using a name recognized by Dune, for example `Episode.pl.srt` beside
+`Episode.mkv`. No Jellyfin-to-NFS path mapping needs to be configured in the
+bridge. If no matching NFS file is found, playback falls back to Jellyfin's HTTP
+URL; resume and returned progress still work, but Dune will not receive the
+external subtitle file.
 
 ## Verification
 
