@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.ComponentName;
 import android.content.Intent;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -19,7 +20,10 @@ public final class BridgeActivity extends Activity {
 	private static final String DUNE_PACKAGE = "com.dunehd.app";
 	private static final String DUNE_PLAYER_ACTIVITY = "com.dunehd.shell.PlayerProxyActivity";
 	private static final String EXTRA_DUNE_PARAMS = "com.dunehd.playback.dune_params";
+	private static final String EXTRA_FILENAME = "filename";
 	private static final String EXTRA_POSITION = "position";
+	private static final String EXTRA_SUBTITLES = "subs";
+	private static final String EXTRA_VLC_SUBTITLES = "subtitles_location";
 	private static final String EXTRA_VLC_POSITION = "extra_position";
 	private static final String DUNE_SKIP_RESUME_POSITION = "skip_resume_position:1";
 	private static final long SEEK_TOLERANCE_MILLIS = 2_000L;
@@ -27,6 +31,7 @@ public final class BridgeActivity extends Activity {
 
 	private final AtomicBoolean resultDelivered = new AtomicBoolean();
 	private final DuneStatusClient statusClient = new DuneStatusClient();
+	private final NfsMediaResolver nfsMediaResolver = new NfsMediaResolver();
 	private final Handler mainHandler = new Handler(Looper.getMainLooper());
 	private volatile long initialPositionMillis;
 	private volatile long lastPositionMillis;
@@ -37,6 +42,11 @@ public final class BridgeActivity extends Activity {
 
 	private final ScheduledExecutorService statusPoller = Executors.newSingleThreadScheduledExecutor(runnable -> {
 		Thread thread = new Thread(runnable, "dune-status-poller");
+		thread.setDaemon(true);
+		return thread;
+	});
+	private final ScheduledExecutorService mediaResolver = Executors.newSingleThreadScheduledExecutor(runnable -> {
+		Thread thread = new Thread(runnable, "dune-media-resolver");
 		thread.setDaemon(true);
 		return thread;
 	});
@@ -57,13 +67,7 @@ public final class BridgeActivity extends Activity {
 			return;
 		}
 
-		try {
-			launchDunePlayer();
-			statusPoller.scheduleWithFixedDelay(this::pollStatus, 0, 1, TimeUnit.SECONDS);
-		} catch (ActivityNotFoundException | SecurityException error) {
-			Log.e(TAG, "Unable to launch Dune player", error);
-			cancelAndFinish();
-		}
+		resolveMediaAndLaunchPlayer();
 	}
 
 	@Override
@@ -88,19 +92,52 @@ public final class BridgeActivity extends Activity {
 	@Override
 	protected void onDestroy() {
 		mainHandler.removeCallbacks(resumeFallback);
+		mediaResolver.shutdownNow();
 		statusPoller.shutdownNow();
 		super.onDestroy();
 	}
 
-	private void launchDunePlayer() {
+	private void resolveMediaAndLaunchPlayer() {
+		Intent incomingIntent = getIntent();
+		if (!hasExternalSubtitles(incomingIntent)) {
+			launchDunePlayer(null);
+			return;
+		}
+
+		String mediaUrl = incomingIntent.getDataString();
+		String fileName = incomingIntent.getStringExtra(EXTRA_FILENAME);
+		mediaResolver.execute(() -> {
+			String nfsUrl = null;
+			try {
+				nfsUrl = nfsMediaResolver.resolve(mediaUrl, fileName);
+			} catch (RuntimeException error) {
+				Log.w(TAG, "NFS media resolution failed; using Jellyfin stream", error);
+			}
+			String resolvedNfsUrl = nfsUrl;
+			mainHandler.post(() -> {
+				if (!isFinishing() && !isDestroyed()) {
+					launchDunePlayer(resolvedNfsUrl == null ? null : Uri.parse(resolvedNfsUrl));
+				}
+			});
+		});
+	}
+
+	private void launchDunePlayer(Uri replacementUri) {
 		Intent duneIntent = new Intent(getIntent());
 		duneIntent.setComponent(new ComponentName(DUNE_PACKAGE, DUNE_PLAYER_ACTIVITY));
 		duneIntent.setFlags(flagsForDunePlayer(duneIntent.getFlags()));
+		if (replacementUri != null) duneIntent.setDataAndType(replacementUri, duneIntent.getType());
 		addDuneParam(duneIntent, DUNE_SKIP_RESUME_POSITION);
 
-		playerLaunchRequested = true;
-		Log.i(TAG, "Launching Dune player for " + describeDestination(duneIntent));
-		startActivity(duneIntent);
+		try {
+			playerLaunchRequested = true;
+			Log.i(TAG, "Launching Dune player for " + describeDestination(duneIntent));
+			startActivity(duneIntent);
+			statusPoller.scheduleWithFixedDelay(this::pollStatus, 0, 1, TimeUnit.SECONDS);
+		} catch (ActivityNotFoundException | SecurityException error) {
+			Log.e(TAG, "Unable to launch Dune player", error);
+			cancelAndFinish();
+		}
 	}
 
 	private void pollStatus() {
@@ -158,6 +195,14 @@ public final class BridgeActivity extends Activity {
 
 	private static long readInitialPositionMillis(Intent intent) {
 		return Math.max(0, intent.getIntExtra(EXTRA_POSITION, 0));
+	}
+
+	private static boolean hasExternalSubtitles(Intent intent) {
+		String[] subtitles = intent.getStringArrayExtra(EXTRA_SUBTITLES);
+		if (subtitles != null && subtitles.length > 0) return true;
+
+		String vlcSubtitle = intent.getStringExtra(EXTRA_VLC_SUBTITLES);
+		return vlcSubtitle != null && !vlcSubtitle.isEmpty();
 	}
 
 	static int flagsForDunePlayer(int flags) {
