@@ -13,6 +13,8 @@ public final class DuneStatusTest {
 		DuneStatus status = DuneStatus.parse("{"
 			+ "\"command_status\":\"ok\","
 			+ "\"player_state\":\"file_playback\","
+			+ "\"playback_url\":\"/mnt/media/episode.mkv\","
+			+ "\"playback_caption\":\"Episode\","
 			+ "\"playback_position\":\"123\","
 			+ "\"playback_duration\":\"456\""
 			+ "}");
@@ -23,6 +25,24 @@ public final class DuneStatusTest {
 		assertEquals(Long.valueOf(123_000), status.getPlaybackPositionMillis());
 		assertEquals(Long.valueOf(456_000), status.getPlaybackDurationMillis());
 		assertTrue(status.isPlaybackActive());
+		assertTrue(status.isReadyForSeek());
+		assertTrue(status.matchesMedia("episode.mkv", "Episode", null));
+		assertFalse(status.matchesMedia("other.mkv", "Other", null));
+	}
+
+	@Test
+	public void matchesHttpPlaybackByTitleOrExactUrl() throws Exception {
+		String url = "http://jellyfin/Videos/id/stream?static=true";
+		DuneStatus status = DuneStatus.parse("{"
+			+ "\"player_state\":\"file_playback\","
+			+ "\"playback_url\":\"" + url + "\","
+			+ "\"playback_caption\":\"Movie\","
+			+ "\"playback_position\":0,"
+			+ "\"playback_duration\":100"
+			+ "}");
+
+		assertTrue(status.matchesMedia("movie.mkv", "Movie", null));
+		assertTrue(status.matchesMedia("movie.mkv", null, url));
 	}
 
 	@Test

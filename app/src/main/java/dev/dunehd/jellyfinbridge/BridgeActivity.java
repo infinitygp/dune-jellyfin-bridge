@@ -8,6 +8,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.Log;
 
 import java.util.concurrent.Executors;
@@ -22,11 +23,9 @@ public final class BridgeActivity extends Activity {
 	private static final String EXTRA_DUNE_PARAMS = "com.dunehd.playback.dune_params";
 	private static final String EXTRA_FILENAME = "filename";
 	private static final String EXTRA_POSITION = "position";
-	private static final String EXTRA_SUBTITLES = "subs";
-	private static final String EXTRA_VLC_SUBTITLES = "subtitles_location";
+	private static final String EXTRA_TITLE = "title";
 	private static final String EXTRA_VLC_POSITION = "extra_position";
 	private static final String DUNE_SKIP_RESUME_POSITION = "skip_resume_position:1";
-	private static final long SEEK_TOLERANCE_MILLIS = 2_000L;
 	private static final long RESUME_FALLBACK_DELAY_MILLIS = 1_000L;
 
 	private final AtomicBoolean resultDelivered = new AtomicBoolean();
@@ -34,9 +33,7 @@ public final class BridgeActivity extends Activity {
 	private final NfsMediaResolver nfsMediaResolver = new NfsMediaResolver();
 	private final Handler mainHandler = new Handler(Looper.getMainLooper());
 	private volatile long initialPositionMillis;
-	private volatile long lastPositionMillis;
-	private volatile boolean playbackObserved;
-	private boolean initialSeekApplied;
+	private volatile PlaybackProgressTracker progressTracker;
 	private boolean playerLaunchRequested;
 	private boolean leftForPlayer;
 
@@ -60,7 +57,6 @@ public final class BridgeActivity extends Activity {
 		super.onCreate(savedInstanceState);
 
 		initialPositionMillis = readInitialPositionMillis(getIntent());
-		lastPositionMillis = initialPositionMillis;
 		if (getIntent().getData() == null) {
 			Log.e(TAG, "Missing media URL");
 			cancelAndFinish();
@@ -75,7 +71,8 @@ public final class BridgeActivity extends Activity {
 		super.onResume();
 		if (!playerLaunchRequested) return;
 
-		if (leftForPlayer || playbackObserved) {
+		PlaybackProgressTracker tracker = progressTracker;
+		if (leftForPlayer || (tracker != null && tracker.isPlaybackObserved())) {
 			deliverResult();
 		} else {
 			mainHandler.postDelayed(resumeFallback, RESUME_FALLBACK_DELAY_MILLIS);
@@ -99,11 +96,6 @@ public final class BridgeActivity extends Activity {
 
 	private void resolveMediaAndLaunchPlayer() {
 		Intent incomingIntent = getIntent();
-		if (!hasExternalSubtitles(incomingIntent)) {
-			launchDunePlayer(null);
-			return;
-		}
-
 		String mediaUrl = incomingIntent.getDataString();
 		String fileName = incomingIntent.getStringExtra(EXTRA_FILENAME);
 		mediaResolver.execute(() -> {
@@ -128,6 +120,12 @@ public final class BridgeActivity extends Activity {
 		duneIntent.setFlags(flagsForDunePlayer(duneIntent.getFlags()));
 		if (replacementUri != null) duneIntent.setDataAndType(replacementUri, duneIntent.getType());
 		addDuneParam(duneIntent, DUNE_SKIP_RESUME_POSITION);
+		progressTracker = new PlaybackProgressTracker(
+			initialPositionMillis,
+			duneIntent.getStringExtra(EXTRA_FILENAME),
+			duneIntent.getStringExtra(EXTRA_TITLE),
+			duneIntent.getDataString()
+		);
 
 		try {
 			playerLaunchRequested = true;
@@ -143,42 +141,35 @@ public final class BridgeActivity extends Activity {
 	private void pollStatus() {
 		try {
 			DuneStatus status = statusClient.fetch();
-			Long positionMillis = status.getPlaybackPositionMillis();
-			if (positionMillis != null) lastPositionMillis = positionMillis;
-			if (status.isPlaybackActive()) {
-				playbackObserved = true;
-				applyInitialPosition(status);
-			}
+			PlaybackProgressTracker tracker = progressTracker;
+			if (tracker == null) return;
+
+			PlaybackProgressTracker.Update update = tracker.onStatus(status, SystemClock.elapsedRealtime());
+			handlePlaybackUpdate(update);
 		} catch (Exception error) {
 			Log.d(TAG, "Dune status poll failed", error);
 		}
 	}
 
-	private void applyInitialPosition(DuneStatus status) {
-		if (initialSeekApplied || initialPositionMillis <= 0) return;
-
-		Long currentPositionMillis = status.getPlaybackPositionMillis();
-		if (currentPositionMillis != null
-			&& Math.abs(currentPositionMillis - initialPositionMillis) <= SEEK_TOLERANCE_MILLIS) {
-			initialSeekApplied = true;
-			return;
-		}
-
-		try {
-			long positionSeconds = initialPositionMillis / 1_000L;
-			statusClient.seekToSeconds(positionSeconds);
-			initialSeekApplied = true;
-			lastPositionMillis = initialPositionMillis;
-			Log.i(TAG, "Applied initial playback position " + positionSeconds + " s");
-		} catch (Exception error) {
-			Log.d(TAG, "Initial playback seek failed; will retry", error);
+	private void handlePlaybackUpdate(PlaybackProgressTracker.Update update) throws Exception {
+		if (update.action == PlaybackProgressTracker.Action.SEEK) {
+			statusClient.seekToSeconds(update.seekPositionSeconds);
+			Log.i(TAG, "Requested initial playback position " + update.seekPositionSeconds
+				+ " s (attempt " + update.seekAttempt + ")");
+		} else if (update.action == PlaybackProgressTracker.Action.CONFIRMED) {
+			Log.i(TAG, "Confirmed initial playback position");
+		} else if (update.action == PlaybackProgressTracker.Action.GAVE_UP) {
+			Log.w(TAG, "Initial playback position was not confirmed after repeated attempts");
 		}
 	}
 
 	private void deliverResult() {
 		if (!resultDelivered.compareAndSet(false, true)) return;
 
-		long positionMillis = Math.max(0, lastPositionMillis);
+		PlaybackProgressTracker tracker = progressTracker;
+		long positionMillis = tracker == null
+			? initialPositionMillis
+			: tracker.getLastPositionMillis();
 		Intent result = new Intent()
 			.putExtra(EXTRA_POSITION, positionMillis)
 			.putExtra(EXTRA_VLC_POSITION, positionMillis);
@@ -195,14 +186,6 @@ public final class BridgeActivity extends Activity {
 
 	private static long readInitialPositionMillis(Intent intent) {
 		return Math.max(0, intent.getIntExtra(EXTRA_POSITION, 0));
-	}
-
-	private static boolean hasExternalSubtitles(Intent intent) {
-		String[] subtitles = intent.getStringArrayExtra(EXTRA_SUBTITLES);
-		if (subtitles != null && subtitles.length > 0) return true;
-
-		String vlcSubtitle = intent.getStringExtra(EXTRA_VLC_SUBTITLES);
-		return vlcSubtitle != null && !vlcSubtitle.isEmpty();
 	}
 
 	static int flagsForDunePlayer(int flags) {
