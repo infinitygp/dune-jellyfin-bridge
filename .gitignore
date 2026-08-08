@@ -5,3 +5,8 @@ build/
 app/build/
 artifacts/
 
+# Release signing material must never be committed.
+*.jks
+*.keystore
+*.p12
+keystore.properties
