@@ -50,6 +50,31 @@ adb connect 192.168.1.181:5555
 adb -s 192.168.1.181:5555 install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
+## Releases
+
+Release APKs are signed with a project-specific key. Keep the keystore and its
+passwords outside the repository, restrict their permissions, and maintain an
+independent backup. Losing the signing key prevents future APKs from updating
+existing installations.
+
+Local release builds use these environment variables:
+
+- `ANDROID_RELEASE_KEYSTORE`
+- `ANDROID_RELEASE_STORE_PASSWORD` or `ANDROID_RELEASE_STORE_PASSWORD_FILE`
+- `ANDROID_RELEASE_KEY_ALIAS`
+- `ANDROID_RELEASE_KEY_PASSWORD` or `ANDROID_RELEASE_KEY_PASSWORD_FILE`
+
+The `Release APK` GitHub Actions workflow uses corresponding repository secrets:
+
+- `ANDROID_RELEASE_KEYSTORE_BASE64`
+- `ANDROID_RELEASE_STORE_PASSWORD`
+- `ANDROID_RELEASE_KEY_ALIAS`
+- `ANDROID_RELEASE_KEY_PASSWORD`
+
+Pushing a tag that exactly matches `v<versionName>`, for example `v0.3.0`, runs
+the tests and release lint, builds and verifies the signed APK, and creates a
+GitHub release containing the APK and its SHA-256 checksum.
+
 In Jellyfin, enable the external player. When Android asks which player should
 handle the video, select **Dune Player (Jellyfin Bridge)**. The bridge will open
 the original Dune player automatically.
