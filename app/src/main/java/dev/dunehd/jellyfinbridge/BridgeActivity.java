@@ -1,15 +1,19 @@
 package dev.dunehd.jellyfinbridge;
 
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.content.ActivityNotFoundException;
 import android.content.ComponentName;
 import android.content.Intent;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.provider.Settings;
 import android.util.Log;
+import android.widget.Toast;
 
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -27,6 +31,7 @@ public final class BridgeActivity extends Activity {
 	private static final String EXTRA_VLC_POSITION = "extra_position";
 	private static final String DUNE_SKIP_RESUME_POSITION = "skip_resume_position:1";
 	private static final long RESUME_FALLBACK_DELAY_MILLIS = 1_000L;
+	private static final long PLAYER_LAUNCH_GRACE_MILLIS = 5_000L;
 
 	private final AtomicBoolean resultDelivered = new AtomicBoolean();
 	private final DuneStatusClient statusClient = new DuneStatusClient();
@@ -34,8 +39,8 @@ public final class BridgeActivity extends Activity {
 	private final Handler mainHandler = new Handler(Looper.getMainLooper());
 	private volatile long initialPositionMillis;
 	private volatile PlaybackProgressTracker progressTracker;
+	private volatile long playerLaunchElapsedRealtime;
 	private boolean playerLaunchRequested;
-	private boolean leftForPlayer;
 
 	private final ScheduledExecutorService statusPoller = Executors.newSingleThreadScheduledExecutor(runnable -> {
 		Thread thread = new Thread(runnable, "dune-status-poller");
@@ -56,6 +61,13 @@ public final class BridgeActivity extends Activity {
 	protected void onCreate(Bundle savedInstanceState) {
 		super.onCreate(savedInstanceState);
 
+		boolean canDrawOverlays = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
+			|| Settings.canDrawOverlays(this);
+		if (needsOverlayPermission(Build.VERSION.SDK_INT, canDrawOverlays)) {
+			requestOverlayPermission();
+			return;
+		}
+
 		initialPositionMillis = readInitialPositionMillis(getIntent());
 		if (getIntent().getData() == null) {
 			Log.e(TAG, "Missing media URL");
@@ -72,17 +84,23 @@ public final class BridgeActivity extends Activity {
 		if (!playerLaunchRequested) return;
 
 		PlaybackProgressTracker tracker = progressTracker;
-		if (leftForPlayer || (tracker != null && tracker.isPlaybackObserved())) {
+		long launchGraceMillis = remainingLaunchGraceMillis(
+			playerLaunchElapsedRealtime,
+			SystemClock.elapsedRealtime()
+		);
+		if (launchGraceMillis == 0 && tracker != null && tracker.isPlaybackObserved()) {
 			deliverResult();
 		} else {
-			mainHandler.postDelayed(resumeFallback, RESUME_FALLBACK_DELAY_MILLIS);
+			mainHandler.postDelayed(
+				resumeFallback,
+				Math.max(RESUME_FALLBACK_DELAY_MILLIS, launchGraceMillis)
+			);
 		}
 	}
 
 	@Override
 	protected void onPause() {
 		mainHandler.removeCallbacks(resumeFallback);
-		if (playerLaunchRequested) leftForPlayer = true;
 		super.onPause();
 	}
 
@@ -129,6 +147,7 @@ public final class BridgeActivity extends Activity {
 
 		try {
 			playerLaunchRequested = true;
+			playerLaunchElapsedRealtime = SystemClock.elapsedRealtime();
 			Log.i(TAG, "Launching Dune player for " + describeDestination(duneIntent));
 			startActivity(duneIntent);
 			statusPoller.scheduleWithFixedDelay(this::pollStatus, 0, 1, TimeUnit.SECONDS);
@@ -158,13 +177,38 @@ public final class BridgeActivity extends Activity {
 				+ " s (attempt " + update.seekAttempt + ")");
 		} else if (update.action == PlaybackProgressTracker.Action.CONFIRMED) {
 			Log.i(TAG, "Confirmed initial playback position");
+		} else if (update.action == PlaybackProgressTracker.Action.USER_OVERRIDE) {
+			Log.i(TAG, "Stopped initial seek retries after a manual position change");
 		} else if (update.action == PlaybackProgressTracker.Action.GAVE_UP) {
 			Log.w(TAG, "Initial playback position was not confirmed after repeated attempts");
+		} else if (update.action == PlaybackProgressTracker.Action.PLAYBACK_ENDED) {
+			Log.i(TAG, "Detected end of Dune playback outside the bridge task");
+			mainHandler.post(this::returnToJellyfin);
 		}
 	}
 
+	private void returnToJellyfin() {
+		if (!setPlaybackResult()) return;
+
+		try {
+			ActivityManager activityManager = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+			if (activityManager != null) {
+				Log.i(TAG, "Bringing the existing Jellyfin task to the foreground");
+				activityManager.moveTaskToFront(getTaskId(), 0);
+			}
+		} catch (SecurityException error) {
+			Log.w(TAG, "Unable to bring the existing Jellyfin task to the foreground", error);
+		}
+		finish();
+	}
+
 	private void deliverResult() {
-		if (!resultDelivered.compareAndSet(false, true)) return;
+		if (!setPlaybackResult()) return;
+		finish();
+	}
+
+	private boolean setPlaybackResult() {
+		if (!resultDelivered.compareAndSet(false, true)) return false;
 
 		PlaybackProgressTracker tracker = progressTracker;
 		long positionMillis = tracker == null
@@ -175,7 +219,7 @@ public final class BridgeActivity extends Activity {
 			.putExtra(EXTRA_VLC_POSITION, positionMillis);
 		Log.i(TAG, "Returning playback position " + positionMillis + " ms");
 		setResult(RESULT_OK, result);
-		finish();
+		return true;
 	}
 
 	private void cancelAndFinish() {
@@ -184,8 +228,31 @@ public final class BridgeActivity extends Activity {
 		finish();
 	}
 
+	private void requestOverlayPermission() {
+		Toast.makeText(this, R.string.overlay_permission_required, Toast.LENGTH_LONG).show();
+		Intent settingsIntent = new Intent(
+			Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+			Uri.parse("package:" + getPackageName())
+		);
+		try {
+			startActivity(settingsIntent);
+		} catch (ActivityNotFoundException | SecurityException error) {
+			Log.e(TAG, "Unable to open overlay permission settings", error);
+		}
+		cancelAndFinish();
+	}
+
 	private static long readInitialPositionMillis(Intent intent) {
 		return Math.max(0, intent.getIntExtra(EXTRA_POSITION, 0));
+	}
+
+	static long remainingLaunchGraceMillis(long launchElapsedRealtime, long currentElapsedRealtime) {
+		long elapsed = Math.max(0, currentElapsedRealtime - launchElapsedRealtime);
+		return Math.max(0, PLAYER_LAUNCH_GRACE_MILLIS - elapsed);
+	}
+
+	static boolean needsOverlayPermission(int sdkVersion, boolean canDrawOverlays) {
+		return sdkVersion >= Build.VERSION_CODES.Q && !canDrawOverlays;
 	}
 
 	static int flagsForDunePlayer(int flags) {

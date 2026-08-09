@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 	<string name="app_name">Dune Player (Jellyfin Bridge)</string>
+	<string name="overlay_permission_required">Allow Dune Jellyfin Bridge to display over other apps, then start playback again.</string>
 </resources>
-

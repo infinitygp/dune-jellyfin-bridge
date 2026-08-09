@@ -27,7 +27,12 @@ adjacent subtitle files.
    player.
 5. Start a video. In Android's player chooser select
    **Dune Player (Jellyfin Bridge)** and choose **Always**. The bridge will open
-   the original Dune player automatically.
+   Android's **Display over other apps** settings on first use. Find
+   **Dune Player (Jellyfin Bridge)** in the list and enable it, return to
+   Jellyfin, and start the video again.
+   The permission lets the bridge restore the existing Jellyfin screen after
+   Dune playback instead of launching Jellyfin from its home screen.
+6. The bridge will open the original Dune player automatically.
 
 To update, download the APK from a newer release and install it over the current
 version. If an older debug or differently signed build is installed, Android may
