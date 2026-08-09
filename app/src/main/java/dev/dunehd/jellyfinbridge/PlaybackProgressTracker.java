@@ -4,8 +4,10 @@ final class PlaybackProgressTracker {
 	private static final long SEEK_CONFIRMATION_TOLERANCE_MILLIS = 5_000L;
 	private static final long SEEK_RETRY_INTERVAL_MILLIS = 2_000L;
 	private static final long SEEK_STABILITY_WINDOW_MILLIS = 15_000L;
-	private static final int REQUIRED_CONFIRMATION_POLLS = 3;
+	private static final long STARTUP_RESET_MAX_POSITION_MILLIS = 15_000L;
+	private static final long MIN_USER_OVERRIDE_POSITION_MILLIS = 30_000L;
 	private static final int MAX_SEEK_ATTEMPTS = 10;
+	private static final int REQUIRED_PLAYBACK_END_POLLS = 2;
 
 	private final long initialPositionMillis;
 	private final String expectedFileName;
@@ -14,12 +16,13 @@ final class PlaybackProgressTracker {
 
 	private long lastPositionMillis;
 	private long lastSeekAttemptMillis;
-	private long seekConfirmedMillis;
+	private long seekConfirmedMillis = -1;
 	private int seekAttempts;
-	private int confirmationPolls;
+	private int playbackEndPolls;
 	private boolean playbackObserved;
 	private boolean initialSeekConfirmed;
 	private boolean giveUpReported;
+	private boolean playbackEndReported;
 
 	PlaybackProgressTracker(
 		long initialPositionMillis,
@@ -36,32 +39,36 @@ final class PlaybackProgressTracker {
 	}
 
 	synchronized Update onStatus(DuneStatus status, long elapsedRealtimeMillis) {
-		if (!status.matchesMedia(expectedFileName, expectedTitle, expectedUrl)) return Update.none();
+		if (!status.matchesMedia(expectedFileName, expectedTitle, expectedUrl)) {
+			return onUnmatchedStatus();
+		}
 
-		playbackObserved = true;
+		playbackEndPolls = 0;
+		if (status.isPlaybackVisible()) playbackObserved = true;
+		if (!playbackObserved) return Update.none();
+
 		Long positionMillis = status.getPlaybackPositionMillis();
+		if (positionMillis != null) lastPositionMillis = positionMillis;
 		if (initialSeekConfirmed) {
 			if (!positionResetDuringStabilityWindow(positionMillis, elapsedRealtimeMillis)) {
-				if (positionMillis != null) lastPositionMillis = positionMillis;
 				return Update.none();
 			}
 			initialSeekConfirmed = false;
-			confirmationPolls = 0;
+			seekConfirmedMillis = -1;
 		}
+		if (!status.isReadyForSeek()) return Update.none();
 
 		if (isNearInitialPosition(positionMillis)) {
-			confirmationPolls++;
-			if (confirmationPolls >= REQUIRED_CONFIRMATION_POLLS) {
-				initialSeekConfirmed = true;
-				seekConfirmedMillis = elapsedRealtimeMillis;
-				lastPositionMillis = positionMillis;
-				return Update.confirmed();
-			}
-			return Update.none();
+			initialSeekConfirmed = true;
+			seekConfirmedMillis = elapsedRealtimeMillis;
+			return Update.confirmed();
+		}
+		if (isLikelyUserSeek(positionMillis)) {
+			initialSeekConfirmed = true;
+			seekConfirmedMillis = -1;
+			return Update.userOverride();
 		}
 
-		confirmationPolls = 0;
-		if (!status.isReadyForSeek()) return Update.none();
 		if (seekAttempts >= MAX_SEEK_ATTEMPTS) {
 			if (giveUpReported) return Update.none();
 			giveUpReported = true;
@@ -75,6 +82,16 @@ final class PlaybackProgressTracker {
 		seekAttempts++;
 		lastSeekAttemptMillis = elapsedRealtimeMillis;
 		return Update.seek(initialPositionMillis / 1_000L, seekAttempts);
+	}
+
+	private Update onUnmatchedStatus() {
+		if (!playbackObserved || playbackEndReported) return Update.none();
+
+		playbackEndPolls++;
+		if (playbackEndPolls < REQUIRED_PLAYBACK_END_POLLS) return Update.none();
+
+		playbackEndReported = true;
+		return Update.playbackEnded();
 	}
 
 	synchronized long getLastPositionMillis() {
@@ -94,18 +111,27 @@ final class PlaybackProgressTracker {
 			&& Math.abs(positionMillis - initialPositionMillis) <= SEEK_CONFIRMATION_TOLERANCE_MILLIS;
 	}
 
-	private boolean positionResetDuringStabilityWindow(Long positionMillis, long elapsedRealtimeMillis) {
-		return initialPositionMillis > 0
+	private boolean isLikelyUserSeek(Long positionMillis) {
+		return seekAttempts > 0
 			&& positionMillis != null
-			&& elapsedRealtimeMillis - seekConfirmedMillis <= SEEK_STABILITY_WINDOW_MILLIS
-			&& positionMillis < initialPositionMillis - SEEK_CONFIRMATION_TOLERANCE_MILLIS;
+			&& positionMillis >= MIN_USER_OVERRIDE_POSITION_MILLIS;
+	}
+
+	private boolean positionResetDuringStabilityWindow(Long positionMillis, long elapsedRealtimeMillis) {
+		return initialPositionMillis > MIN_USER_OVERRIDE_POSITION_MILLIS
+			&& seekConfirmedMillis >= 0
+			&& positionMillis != null
+			&& positionMillis <= STARTUP_RESET_MAX_POSITION_MILLIS
+			&& elapsedRealtimeMillis - seekConfirmedMillis <= SEEK_STABILITY_WINDOW_MILLIS;
 	}
 
 	enum Action {
 		NONE,
 		SEEK,
 		CONFIRMED,
+		USER_OVERRIDE,
 		GAVE_UP,
+		PLAYBACK_ENDED,
 	}
 
 	static final class Update {
@@ -131,8 +157,16 @@ final class PlaybackProgressTracker {
 			return new Update(Action.CONFIRMED, 0, 0);
 		}
 
+		static Update userOverride() {
+			return new Update(Action.USER_OVERRIDE, 0, 0);
+		}
+
 		static Update gaveUp() {
 			return new Update(Action.GAVE_UP, 0, 0);
+		}
+
+		static Update playbackEnded() {
+			return new Update(Action.PLAYBACK_ENDED, 0, 0);
 		}
 	}
 }

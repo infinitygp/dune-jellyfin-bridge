@@ -68,6 +68,81 @@ public final class DuneStatusTest {
 	}
 
 	@Test
+	public void stoppedPlaybackIsInactiveEvenWithStalePosition() throws Exception {
+		DuneStatus status = DuneStatus.parse("{"
+			+ "\"player_state\":\"file_playback\","
+			+ "\"playback_state\":\"stopped\","
+			+ "\"playback_url\":\"/mnt/media/episode.mkv\","
+			+ "\"playback_position\":123,"
+			+ "\"playback_duration\":456"
+			+ "}");
+
+		assertFalse(status.isPlaybackActive());
+		assertFalse(status.isReadyForSeek());
+		assertFalse(status.matchesMedia("episode.mkv", null, null));
+	}
+
+	@Test
+	public void hiddenPlaybackIsNotReadyForSeek() throws Exception {
+		DuneStatus status = DuneStatus.parse("{"
+			+ "\"player_state\":\"file_playback\","
+			+ "\"playback_state\":\"paused\","
+			+ "\"playback_position\":123,"
+			+ "\"playback_duration\":456,"
+			+ "\"video_enabled\":\"0\","
+			+ "\"playback_window_fullscreen\":\"0\""
+			+ "}");
+
+		assertTrue(status.isPlaybackActive());
+		assertFalse(status.isPlaybackVisible());
+		assertFalse(status.isReadyForSeek());
+	}
+
+	@Test
+	public void visiblePlaybackIsReadyForSeek() throws Exception {
+		DuneStatus status = DuneStatus.parse("{"
+			+ "\"player_state\":\"file_playback\","
+			+ "\"playback_position\":123,"
+			+ "\"playback_duration\":456,"
+			+ "\"video_enabled\":1,"
+			+ "\"playback_window_fullscreen\":0"
+			+ "}");
+
+		assertTrue(status.isPlaybackVisible());
+		assertTrue(status.isReadyForSeek());
+	}
+
+	@Test
+	public void nativeDunePlaybackIsVisibleDespiteDisabledAndroidVideoFlags() throws Exception {
+		DuneStatus status = DuneStatus.parse("{"
+			+ "\"android_app_active\":\"0\","
+			+ "\"player_state\":\"file_playback\","
+			+ "\"playback_state\":\"playing\","
+			+ "\"playback_position\":123,"
+			+ "\"playback_duration\":456,"
+			+ "\"video_enabled\":\"0\","
+			+ "\"playback_window_fullscreen\":\"0\""
+			+ "}");
+
+		assertTrue(status.isPlaybackVisible());
+		assertTrue(status.isReadyForSeek());
+	}
+
+	@Test
+	public void matchingPlaybackBehindAndroidAppIsNotVisible() throws Exception {
+		DuneStatus status = DuneStatus.parse("{"
+			+ "\"android_app_active\":\"1\","
+			+ "\"player_state\":\"file_playback\","
+			+ "\"playback_state\":\"paused\","
+			+ "\"playback_position\":123,"
+			+ "\"playback_duration\":456"
+			+ "}");
+
+		assertFalse(status.isPlaybackVisible());
+		assertFalse(status.isReadyForSeek());
+	}
+
+	@Test
 	public void ignoresUnknownAndNegativePositions() throws Exception {
 		DuneStatus unknown = DuneStatus.parse("{"
 			+ "\"player_state\":\"file_playback\","
