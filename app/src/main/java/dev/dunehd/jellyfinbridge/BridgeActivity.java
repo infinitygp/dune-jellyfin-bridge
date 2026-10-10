@@ -32,6 +32,10 @@ public final class BridgeActivity extends Activity {
 	private static final String DUNE_SKIP_RESUME_POSITION = "skip_resume_position:1";
 	private static final long RESUME_FALLBACK_DELAY_MILLIS = 1_000L;
 	private static final long PLAYER_LAUNCH_GRACE_MILLIS = 5_000L;
+	private static final long POLL_INTERVAL_MILLIS = 1_000L;
+	// Poll faster while the resume seek is pending so the film does not visibly play from zero.
+	private static final long STARTUP_POLL_INTERVAL_MILLIS = 250L;
+	private static final long STARTUP_POLL_WINDOW_MILLIS = 30_000L;
 
 	private final AtomicBoolean resultDelivered = new AtomicBoolean();
 	private final DuneStatusClient statusClient = new DuneStatusClient();
@@ -42,13 +46,8 @@ public final class BridgeActivity extends Activity {
 	private volatile long playerLaunchElapsedRealtime;
 	private boolean playerLaunchRequested;
 
-	private final ScheduledExecutorService statusPoller = Executors.newSingleThreadScheduledExecutor(runnable -> {
-		Thread thread = new Thread(runnable, "dune-status-poller");
-		thread.setDaemon(true);
-		return thread;
-	});
-	private final ScheduledExecutorService mediaResolver = Executors.newSingleThreadScheduledExecutor(runnable -> {
-		Thread thread = new Thread(runnable, "dune-media-resolver");
+	private final ScheduledExecutorService worker = Executors.newSingleThreadScheduledExecutor(runnable -> {
+		Thread thread = new Thread(runnable, "dune-bridge-worker");
 		thread.setDaemon(true);
 		return thread;
 	});
@@ -60,6 +59,14 @@ public final class BridgeActivity extends Activity {
 	@Override
 	protected void onCreate(Bundle savedInstanceState) {
 		super.onCreate(savedInstanceState);
+
+		// A recreated instance has lost its tracker; launching again would restart
+		// playback the user has just left.
+		if (savedInstanceState != null) {
+			Log.w(TAG, "Bridge was recreated; not launching the player again");
+			cancelAndFinish();
+			return;
+		}
 
 		boolean canDrawOverlays = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
 			|| Settings.canDrawOverlays(this);
@@ -107,8 +114,7 @@ public final class BridgeActivity extends Activity {
 	@Override
 	protected void onDestroy() {
 		mainHandler.removeCallbacks(resumeFallback);
-		mediaResolver.shutdownNow();
-		statusPoller.shutdownNow();
+		worker.shutdownNow();
 		super.onDestroy();
 	}
 
@@ -116,7 +122,7 @@ public final class BridgeActivity extends Activity {
 		Intent incomingIntent = getIntent();
 		String mediaUrl = incomingIntent.getDataString();
 		String fileName = incomingIntent.getStringExtra(EXTRA_FILENAME);
-		mediaResolver.execute(() -> {
+		worker.execute(() -> {
 			String nfsUrl = null;
 			try {
 				nfsUrl = nfsMediaResolver.resolve(mediaUrl, fileName);
@@ -150,7 +156,7 @@ public final class BridgeActivity extends Activity {
 			playerLaunchElapsedRealtime = SystemClock.elapsedRealtime();
 			Log.i(TAG, "Launching Dune player for " + describeDestination(duneIntent));
 			startActivity(duneIntent);
-			statusPoller.scheduleWithFixedDelay(this::pollStatus, 0, 1, TimeUnit.SECONDS);
+			worker.execute(this::pollStatus);
 		} catch (ActivityNotFoundException | SecurityException error) {
 			Log.e(TAG, "Unable to launch Dune player", error);
 			cancelAndFinish();
@@ -167,6 +173,18 @@ public final class BridgeActivity extends Activity {
 			handlePlaybackUpdate(update);
 		} catch (Exception error) {
 			Log.d(TAG, "Dune status poll failed", error);
+		}
+
+		PlaybackProgressTracker tracker = progressTracker;
+		boolean seekPending = tracker != null
+			&& !tracker.isInitialSeekConfirmed()
+			&& SystemClock.elapsedRealtime() - playerLaunchElapsedRealtime < STARTUP_POLL_WINDOW_MILLIS;
+		if (!worker.isShutdown()) {
+			worker.schedule(
+				this::pollStatus,
+				seekPending ? STARTUP_POLL_INTERVAL_MILLIS : POLL_INTERVAL_MILLIS,
+				TimeUnit.MILLISECONDS
+			);
 		}
 	}
 

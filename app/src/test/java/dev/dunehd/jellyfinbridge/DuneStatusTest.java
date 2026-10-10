@@ -46,6 +46,28 @@ public final class DuneStatusTest {
 	}
 
 	@Test
+	public void matchesLocalFileNameContainingUrlDelimiters() throws Exception {
+		DuneStatus status = DuneStatus.parse("{"
+			+ "\"player_state\":\"file_playback\","
+			+ "\"playback_url\":\"/tmp/mnt/network/3/tv/Show/Pilot #1 - Why?.mkv\","
+			+ "\"playback_position\":5"
+			+ "}");
+
+		assertTrue(status.matchesMedia("Pilot #1 - Why?.mkv", null, null));
+	}
+
+	@Test
+	public void matchesHttpFileNameBeforeQuery() throws Exception {
+		DuneStatus status = DuneStatus.parse("{"
+			+ "\"player_state\":\"file_playback\","
+			+ "\"playback_url\":\"http://host/media/movie.mkv?token=1#t\","
+			+ "\"playback_position\":5"
+			+ "}");
+
+		assertTrue(status.matchesMedia("movie.mkv", null, null));
+	}
+
+	@Test
 	public void parsesNumericValues() throws Exception {
 		DuneStatus status = DuneStatus.parse("{"
 			+ "\"player_state\":\"bluray_playback\","

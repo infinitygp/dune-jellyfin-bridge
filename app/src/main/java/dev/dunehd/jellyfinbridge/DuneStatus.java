@@ -103,18 +103,10 @@ final class DuneStatus {
 		return !hasText(expectedFileName) && !hasText(expectedTitle) && !hasText(expectedUrl);
 	}
 
-	private static String baseName(String value) {
-		if (!hasText(value)) return "";
-
-		int end = value.length();
-		int query = value.indexOf('?');
-		int fragment = value.indexOf('#');
-		if (query >= 0) end = Math.min(end, query);
-		if (fragment >= 0) end = Math.min(end, fragment);
-
-		String path = value.substring(0, end);
-		int slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
-		return slash >= 0 ? path.substring(slash + 1) : path;
+	private static String baseName(String url) {
+		// Only HTTP URLs carry a query; '?' and '#' are ordinary characters in file names.
+		if (url.startsWith("http://") || url.startsWith("https://")) url = url.split("[?#]", 2)[0];
+		return NfsMediaResolver.baseName(url);
 	}
 
 	private static boolean hasText(String value) {

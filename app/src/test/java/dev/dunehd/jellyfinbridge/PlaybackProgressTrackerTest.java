@@ -39,7 +39,7 @@ public final class PlaybackProgressTrackerTest {
 		assertEquals(PlaybackProgressTracker.Action.NONE, tooSoon.action);
 		assertEquals(PlaybackProgressTracker.Action.SEEK, retry.action);
 		assertEquals(2, retry.seekAttempt);
-		assertEquals(0, tracker.getLastPositionMillis());
+		assertEquals(INITIAL_POSITION, tracker.getLastPositionMillis());
 		assertFalse(tracker.isInitialSeekConfirmed());
 
 		assertEquals(
@@ -67,7 +67,18 @@ public final class PlaybackProgressTrackerTest {
 
 		assertEquals(PlaybackProgressTracker.Action.NONE, update.action);
 		assertTrue(tracker.isPlaybackObserved());
-		assertEquals(0, tracker.getLastPositionMillis());
+		assertEquals(INITIAL_POSITION, tracker.getLastPositionMillis());
+	}
+
+	@Test
+	public void tracksProgressPastResumePointWhenSeekNeverBecomesPossible() throws Exception {
+		PlaybackProgressTracker tracker = tracker();
+
+		tracker.onStatus(statusWithoutDuration("/mnt/movie.mkv", TITLE, 3_000), 0);
+		assertEquals(INITIAL_POSITION, tracker.getLastPositionMillis());
+
+		tracker.onStatus(statusWithoutDuration("/mnt/movie.mkv", TITLE, 3_700), 1_000);
+		assertEquals(3_700_000L, tracker.getLastPositionMillis());
 	}
 
 	@Test
@@ -111,8 +122,28 @@ public final class PlaybackProgressTrackerTest {
 	}
 
 	@Test
-	public void retriesWhenConfirmedPositionResetsToBeginning() throws Exception {
+	public void leavesPositionAloneAfterConfirmedSeekOnNfs() throws Exception {
 		PlaybackProgressTracker tracker = tracker();
+		tracker.onStatus(status("/mnt/movie.mkv", TITLE, 3_600, 7_200), 0);
+
+		PlaybackProgressTracker.Update userJumpToStart = tracker.onStatus(
+			status("/mnt/movie.mkv", TITLE, 0, 7_200),
+			2_000
+		);
+
+		assertEquals(PlaybackProgressTracker.Action.NONE, userJumpToStart.action);
+		assertTrue(tracker.isInitialSeekConfirmed());
+		assertEquals(0, tracker.getLastPositionMillis());
+	}
+
+	@Test
+	public void retriesWhenConfirmedPositionResetsToBeginningOfStream() throws Exception {
+		PlaybackProgressTracker tracker = new PlaybackProgressTracker(
+			INITIAL_POSITION,
+			FILE_NAME,
+			TITLE,
+			"http://jellyfin/Videos/id/stream?static=true"
+		);
 		assertEquals(
 			PlaybackProgressTracker.Action.CONFIRMED,
 			tracker.onStatus(status("/mnt/movie.mkv", TITLE, 3_600, 7_200), 0).action
@@ -126,6 +157,31 @@ public final class PlaybackProgressTrackerTest {
 		assertEquals(PlaybackProgressTracker.Action.SEEK, reset.action);
 		assertEquals(1, reset.seekAttempt);
 		assertFalse(tracker.isInitialSeekConfirmed());
+		assertEquals(INITIAL_POSITION, tracker.getLastPositionMillis());
+	}
+
+	@Test
+	public void tracksRealPositionAfterGivingUpOnSeek() throws Exception {
+		PlaybackProgressTracker tracker = tracker();
+		long now = 0;
+		for (int attempt = 0; attempt < 10; attempt++, now += 2_000) {
+			assertEquals(
+				PlaybackProgressTracker.Action.SEEK,
+				tracker.onStatus(status("/mnt/movie.mkv", TITLE, now / 1_000, 7_200), now).action
+			);
+		}
+		assertEquals(INITIAL_POSITION, tracker.getLastPositionMillis());
+
+		assertEquals(
+			PlaybackProgressTracker.Action.GAVE_UP,
+			tracker.onStatus(status("/mnt/movie.mkv", TITLE, 20, 7_200), now).action
+		);
+		assertEquals(20_000L, tracker.getLastPositionMillis());
+		assertEquals(
+			PlaybackProgressTracker.Action.NONE,
+			tracker.onStatus(status("/mnt/movie.mkv", TITLE, 31, 7_200), now + 11_000).action
+		);
+		assertEquals(31_000L, tracker.getLastPositionMillis());
 	}
 
 	@Test
@@ -136,6 +192,17 @@ public final class PlaybackProgressTrackerTest {
 		assertEquals(PlaybackProgressTracker.Action.NONE, tracker.onStatus(navigator(), 1_000).action);
 		assertEquals(PlaybackProgressTracker.Action.PLAYBACK_ENDED, tracker.onStatus(navigator(), 2_000).action);
 		assertEquals(PlaybackProgressTracker.Action.NONE, tracker.onStatus(navigator(), 3_000).action);
+	}
+
+	@Test
+	public void fastPollsDoNotShortenPlaybackEndConfirmation() throws Exception {
+		PlaybackProgressTracker tracker = tracker();
+		tracker.onStatus(status("/mnt/movie.mkv", TITLE, 3_600, 7_200), 0);
+
+		assertEquals(PlaybackProgressTracker.Action.NONE, tracker.onStatus(navigator(), 1_000).action);
+		assertEquals(PlaybackProgressTracker.Action.NONE, tracker.onStatus(navigator(), 1_250).action);
+		assertEquals(PlaybackProgressTracker.Action.NONE, tracker.onStatus(navigator(), 1_750).action);
+		assertEquals(PlaybackProgressTracker.Action.PLAYBACK_ENDED, tracker.onStatus(navigator(), 2_000).action);
 	}
 
 	@Test

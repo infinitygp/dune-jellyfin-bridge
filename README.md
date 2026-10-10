@@ -32,6 +32,11 @@ adjacent subtitle files.
    Jellyfin, and start the video again.
    The permission lets the bridge restore the existing Jellyfin screen after
    Dune playback instead of launching Jellyfin from its home screen.
+   If the firmware has no such settings screen, grant it over ADB:
+
+   ```sh
+   adb -s <DUNE_IP>:5555 shell appops set dev.dunehd.jellyfinbridge SYSTEM_ALERT_WINDOW allow
+   ```
 6. The bridge will open the original Dune player automatically.
 
 To update, download the APK from a newer release and install it over the current

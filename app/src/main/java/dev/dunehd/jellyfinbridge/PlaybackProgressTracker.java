@@ -7,21 +7,21 @@ final class PlaybackProgressTracker {
 	private static final long STARTUP_RESET_MAX_POSITION_MILLIS = 15_000L;
 	private static final long MIN_USER_OVERRIDE_POSITION_MILLIS = 30_000L;
 	private static final int MAX_SEEK_ATTEMPTS = 10;
-	private static final int REQUIRED_PLAYBACK_END_POLLS = 2;
+	private static final long PLAYBACK_END_CONFIRMATION_MILLIS = 1_000L;
 
 	private final long initialPositionMillis;
 	private final String expectedFileName;
 	private final String expectedTitle;
 	private final String expectedUrl;
+	private final boolean startupResetExpected;
 
 	private long lastPositionMillis;
 	private long lastSeekAttemptMillis;
 	private long seekConfirmedMillis = -1;
 	private int seekAttempts;
-	private int playbackEndPolls;
+	private long unmatchedSinceMillis = -1;
 	private boolean playbackObserved;
 	private boolean initialSeekConfirmed;
-	private boolean giveUpReported;
 	private boolean playbackEndReported;
 
 	PlaybackProgressTracker(
@@ -35,27 +35,38 @@ final class PlaybackProgressTracker {
 		this.expectedFileName = NfsMediaResolver.baseName(expectedFileName);
 		this.expectedTitle = expectedTitle;
 		this.expectedUrl = expectedUrl;
+		// shortcut: a confirmed seek was never seen to reset over NFS (10 starts, 45 GB remux
+		// included), so only streams are guarded; extend this if a reset shows up elsewhere.
+		this.startupResetExpected = expectedUrl != null
+			&& (expectedUrl.startsWith("http://") || expectedUrl.startsWith("https://"));
 		this.initialSeekConfirmed = this.initialPositionMillis == 0;
 	}
 
 	synchronized Update onStatus(DuneStatus status, long elapsedRealtimeMillis) {
 		if (!status.matchesMedia(expectedFileName, expectedTitle, expectedUrl)) {
-			return onUnmatchedStatus();
+			return onUnmatchedStatus(elapsedRealtimeMillis);
 		}
 
-		playbackEndPolls = 0;
+		unmatchedSinceMillis = -1;
 		if (status.isPlaybackVisible()) playbackObserved = true;
 		if (!playbackObserved) return Update.none();
 
 		Long positionMillis = status.getPlaybackPositionMillis();
-		if (positionMillis != null) lastPositionMillis = positionMillis;
-		if (initialSeekConfirmed) {
-			if (!positionResetDuringStabilityWindow(positionMillis, elapsedRealtimeMillis)) {
-				return Update.none();
-			}
-			initialSeekConfirmed = false;
-			seekConfirmedMillis = -1;
+		Update update = initialSeekConfirmed
+			&& !positionResetDuringStabilityWindow(positionMillis, elapsedRealtimeMillis)
+			? Update.none()
+			: applyInitialSeek(status, positionMillis, elapsedRealtimeMillis);
+		// Dune reports positions near zero until the resume seek settles; returning
+		// one of those would erase the resume point stored by Jellyfin.
+		if (positionMillis != null && (initialSeekConfirmed || positionMillis > lastPositionMillis)) {
+			lastPositionMillis = positionMillis;
 		}
+		return update;
+	}
+
+	private Update applyInitialSeek(DuneStatus status, Long positionMillis, long elapsedRealtimeMillis) {
+		initialSeekConfirmed = false;
+		seekConfirmedMillis = -1;
 		if (!status.isReadyForSeek()) return Update.none();
 
 		if (isNearInitialPosition(positionMillis)) {
@@ -70,8 +81,7 @@ final class PlaybackProgressTracker {
 		}
 
 		if (seekAttempts >= MAX_SEEK_ATTEMPTS) {
-			if (giveUpReported) return Update.none();
-			giveUpReported = true;
+			initialSeekConfirmed = true;
 			return Update.gaveUp();
 		}
 		if (seekAttempts > 0
@@ -84,11 +94,11 @@ final class PlaybackProgressTracker {
 		return Update.seek(initialPositionMillis / 1_000L, seekAttempts);
 	}
 
-	private Update onUnmatchedStatus() {
+	private Update onUnmatchedStatus(long elapsedRealtimeMillis) {
 		if (!playbackObserved || playbackEndReported) return Update.none();
 
-		playbackEndPolls++;
-		if (playbackEndPolls < REQUIRED_PLAYBACK_END_POLLS) return Update.none();
+		if (unmatchedSinceMillis < 0) unmatchedSinceMillis = elapsedRealtimeMillis;
+		if (elapsedRealtimeMillis - unmatchedSinceMillis < PLAYBACK_END_CONFIRMATION_MILLIS) return Update.none();
 
 		playbackEndReported = true;
 		return Update.playbackEnded();
@@ -117,8 +127,11 @@ final class PlaybackProgressTracker {
 			&& positionMillis >= MIN_USER_OVERRIDE_POSITION_MILLIS;
 	}
 
+	// shortcut: a user jumping back to the start within the window is indistinguishable
+	// from Dune's startup reset and gets re-seeked, shorten the window if that annoys.
 	private boolean positionResetDuringStabilityWindow(Long positionMillis, long elapsedRealtimeMillis) {
-		return initialPositionMillis > MIN_USER_OVERRIDE_POSITION_MILLIS
+		return startupResetExpected
+			&& initialPositionMillis > MIN_USER_OVERRIDE_POSITION_MILLIS
 			&& seekConfirmedMillis >= 0
 			&& positionMillis != null
 			&& positionMillis <= STARTUP_RESET_MAX_POSITION_MILLIS

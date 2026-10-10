@@ -14,10 +14,8 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.Set;
 
 import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.parsers.ParserConfigurationException;
@@ -29,12 +27,21 @@ final class NfsMediaResolver {
 	private static final int MAX_VISITED_ENTRIES = 100_000;
 	private static final int MAX_DIRECTORY_DEPTH = 64;
 
+	// shortcut: forgotten when the process dies, persist it if cold lookups become slow.
+	private static volatile File lastMatchDirectory;
+
 	String resolve(String httpMediaUrl, String suppliedFileName) {
 		String fileName = baseName(suppliedFileName);
 		if (fileName == null || fileName.isEmpty()) return null;
 
+		List<NfsMount> mounts = readMountedNfsShares(NETWORK_MOUNT_LIST);
+		if (mounts.isEmpty()) {
+			Log.i(TAG, "No mounted NFS shares; using Jellyfin stream");
+			return null;
+		}
+
 		long expectedSize = fetchContentLength(httpMediaUrl);
-		for (NfsMount mount : readMountedNfsShares(NETWORK_MOUNT_LIST)) {
+		for (NfsMount mount : mounts) {
 			File match = findFile(mount, fileName, expectedSize);
 			if (match == null) continue;
 
@@ -49,18 +56,25 @@ final class NfsMediaResolver {
 		return null;
 	}
 
-	private static File findFile(NfsMount mount, String fileName, long expectedSize) {
-		File root = new File(mount.localPath);
+	static File findFile(NfsMount mount, String fileName, long expectedSize) {
 		SearchState state = new SearchState(expectedSize);
-		searchDirectory(root, fileName, 0, state);
-		return state.exactSizeMatch != null ? state.exactSizeMatch : state.firstNameMatch;
+		// The next episode usually sits next to the previous one.
+		File lastDirectory = lastMatchDirectory;
+		if (lastDirectory != null && lastDirectory.getPath().startsWith(mount.localPath + "/")) {
+			File candidate = new File(lastDirectory, fileName);
+			if (candidate.isFile() && state.matchesSize(candidate)) return candidate;
+		}
+
+		searchDirectory(new File(mount.localPath), fileName, 0, state);
+		if (state.visitedEntries >= MAX_VISITED_ENTRIES) {
+			Log.w(TAG, "Stopped searching " + mount.localPath + " after " + MAX_VISITED_ENTRIES + " entries");
+		}
+		if (state.match != null) lastMatchDirectory = state.match.getParentFile();
+		return state.match;
 	}
 
 	private static boolean searchDirectory(File directory, String fileName, int depth, SearchState state) {
 		if (depth > MAX_DIRECTORY_DEPTH || state.visitedEntries >= MAX_VISITED_ENTRIES) return false;
-
-		String directoryPath = directory.getAbsolutePath();
-		if (!state.visitedDirectories.add(directoryPath)) return false;
 
 		File[] children;
 		try {
@@ -75,12 +89,10 @@ final class NfsMediaResolver {
 			if (++state.visitedEntries > MAX_VISITED_ENTRIES) return false;
 			if (child.isDirectory()) {
 				directories.add(child);
-			} else if (fileName.equals(child.getName())) {
-				if (state.firstNameMatch == null) state.firstNameMatch = child;
-				if (state.expectedSize < 0 || child.length() == state.expectedSize) {
-					state.exactSizeMatch = child;
-					return true;
-				}
+			} else if (fileName.equals(child.getName()) && state.matchesSize(child)) {
+				// A same-named file of another size is a different video, never a fallback.
+				state.match = child;
+				return true;
 			}
 		}
 
@@ -122,16 +134,19 @@ final class NfsMediaResolver {
 			if (contentLength == null) return -1;
 			return Long.parseLong(contentLength);
 		} catch (IOException | NumberFormatException error) {
-			Log.d(TAG, "Unable to read Jellyfin media length", error);
+			Log.w(TAG, "Unable to read Jellyfin media length", error);
 			return -1;
 		} finally {
 			if (connection != null) connection.disconnect();
 		}
 	}
 
-	private static List<NfsMount> readMountedNfsShares(File mountList) {
+	static List<NfsMount> readMountedNfsShares(File mountList) {
 		List<NfsMount> mounts = new ArrayList<>();
-		if (!mountList.isFile()) return mounts;
+		if (!mountList.isFile()) {
+			Log.w(TAG, "Dune NFS mount list is missing: " + mountList);
+			return mounts;
+		}
 
 		try {
 			DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
@@ -149,7 +164,7 @@ final class NfsMediaResolver {
 				if (mount != null) mounts.add(mount);
 			}
 		} catch (IOException | ParserConfigurationException | SAXException | RuntimeException error) {
-			Log.d(TAG, "Unable to read Dune NFS mounts", error);
+			Log.w(TAG, "Unable to read Dune NFS mounts", error);
 		}
 
 		Collections.sort(mounts, (first, second) -> Long.compare(second.mountTime, first.mountTime));
@@ -226,13 +241,15 @@ final class NfsMediaResolver {
 
 	private static final class SearchState {
 		final long expectedSize;
-		final Set<String> visitedDirectories = new HashSet<>();
 		int visitedEntries;
-		File firstNameMatch;
-		File exactSizeMatch;
+		File match;
 
 		SearchState(long expectedSize) {
 			this.expectedSize = expectedSize;
+		}
+
+		boolean matchesSize(File file) {
+			return expectedSize < 0 || file.length() == expectedSize;
 		}
 	}
 }
